@@ -40,8 +40,11 @@ class WebDatasetReader:
         shards = [s for pattern in list(self.shards) for s in braceexpand(pattern)]
         if self.shuffle:
             random.shuffle(shards)
-    
-        dataset = wds.WebDataset(shards, handler=wds.handlers.warn_and_continue).decode(self.decode)
+
+        dataset = wds.WebDataset(shards, handler=wds.handlers.warn_and_continue)
+        # keep image bytes for decoding later (e.g with DALI)
+        if self.decode:
+            dataset = dataset.decode(self.decode)
         if self.shuffle:
             dataset = dataset.shuffle(1000)
         dataset = dataset.to_tuple("jpg", "txt", "__key__")
