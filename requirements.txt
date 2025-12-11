@@ -5,4 +5,4 @@ pyyaml
 torch
 onnxruntime
 tritonclient[grpc]
-nvidia-dali
+nvidia-dali-cuda120
