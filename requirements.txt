@@ -1,0 +1,8 @@
+braceexpand
+webdataset
+numpy
+pyyaml
+torch
+onnxruntime
+tritonclient[grpc]
+nvidia-dali
