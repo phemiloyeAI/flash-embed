@@ -1,0 +1,264 @@
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterator, Optional, Tuple, List
+import os
+import time
+import concurrent.futures as cf
+
+import webdataset
+
+
+@dataclass(frozen=True)
+class Record:
+    path: Path
+    relpath: str
+    key: str
+    label: Optional[str] = None
+
+
+@dataclass
+class Metrics:
+    start_time: float = 0.0
+    end_time: float = 0.0
+    wall_total: float = 0.0
+    wall_read: float = 0.0
+    wall_write: float = 0.0
+
+    last_log_time: float = 0.0
+    num_samples: int = 0
+    num_bytes: int = 0
+
+    t_enum: float = 0.0
+    t_read: float = 0.0
+    t_write: float = 0.0
+
+
+def start_timer() -> float:
+    return time.perf_counter()
+
+
+def stop_timer(t0: float) -> float:
+    return time.perf_counter() - t0
+
+
+def _is_image(p: Path) -> bool:
+    s = p.suffix.lower()
+    return s in {".jpg", ".jpeg", ".png", ".jfif", ".jpe", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def make_key_from_relpath(relpath: str) -> str:
+    rp = relpath.replace("\\", "/")
+    if "." in rp:
+        rp = rp.rsplit(".", 1)[0]
+    return rp
+
+
+def iter_train_records(train_root: Path) -> Iterator[Record]:
+    for wnid_dir in sorted([p for p in train_root.iterdir() if p.is_dir()]):
+        images_dir = wnid_dir / "images"
+        if not images_dir.exists():
+            continue
+        for img_path in sorted([p for p in images_dir.iterdir() if p.is_file() and _is_image(p)]):
+            relpath = f"{wnid_dir.name}/images/{img_path.name}"
+            key = make_key_from_relpath(relpath)
+            yield Record(path=img_path, relpath=relpath, key=key, label=wnid_dir.name)
+
+
+def iter_test_records(split_root: Path) -> Iterator[Record]:
+    images_dir = split_root / "images"
+    for img_path in sorted([p for p in images_dir.iterdir() if p.is_file() and _is_image(p)]):
+        relpath = f"images/{img_path.name}"
+        key = make_key_from_relpath(relpath)
+        yield Record(path=img_path, relpath=relpath, key=key, label=None)
+
+
+def iter_split_records(dataset_root: Path, split: str) -> Iterator[Record]:
+    if split == "train":
+        yield from iter_train_records(dataset_root / "train")
+    elif split in ["test", "val"]:
+        yield from iter_test_records(dataset_root / split)
+    else:
+        raise ValueError(f"unknown split: {split}")
+
+
+def collect_split_records(dataset_root: Path, split: str):
+    t0 = start_timer()
+    records = list(iter_split_records(dataset_root, split))
+    return records, stop_timer(t0)
+
+
+def read_image_bytes(record: Record) -> Tuple[Record, bytes, float]:
+    t0 = time.perf_counter()
+    data = record.path.read_bytes()
+    return record, data, time.perf_counter() - t0
+
+
+def make_wds_sample(record: Record, img_bytes: bytes) -> dict:
+    suffix = record.path.suffix.lower()
+    ext = "png" if suffix == ".png" else "jpg"
+    return {
+        "__key__": record.key,
+        ext: img_bytes,
+        "path.txt": record.relpath.encode("utf-8"),
+    }
+
+
+def maybe_log_progress(metrics: Metrics, every_secs: float = 2.0) -> None:
+    now = time.perf_counter()
+    if metrics.last_log_time == 0.0:
+        metrics.last_log_time = now
+        return
+    if now - metrics.last_log_time < every_secs:
+        return
+    elapsed = now - metrics.start_time
+    if elapsed <= 0:
+        return
+    sps = metrics.num_samples / elapsed
+    mb = metrics.num_bytes / (1024 * 1024)
+    mbps = mb / elapsed
+    rps = metrics.num_samples / metrics.t_read if metrics.t_read > 0 else 0.0
+    wps = metrics.num_samples / metrics.t_write if metrics.t_write > 0 else 0.0
+    print(
+        f"samples={metrics.num_samples}  "
+        f"elapsed={elapsed:.1f}s  "
+        # f"sps={sps:.1f}  "
+        f"read_MB={mb:.1f}  "
+        f"MBps={mbps:.1f}  "
+        f"read_sps={rps:.1f}  "
+        f"write_sps={wps:.1f} "
+        f"throughput={metrics.num_samples / elapsed:.1f} samples/s"
+    )
+    metrics.last_log_time = now
+
+
+def write_split_shards(
+    dataset_root: Path,
+    split: str,
+    out_pattern: str,
+    shard_size: int,
+    num_reader_threads: int,
+    max_inflight: int,
+) -> Metrics:
+    metrics = Metrics(start_time=time.perf_counter())
+
+    records, t_enum = collect_split_records(dataset_root, split)
+    metrics.t_enum = t_enum
+
+    out_dir = Path(out_pattern).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sink = webdataset.ShardWriter(out_pattern, maxcount=shard_size)
+
+    inflight = set()
+    read_phase_started = False
+    t_read_phase0 = 0.0
+    t_read_phase1 = 0.0
+
+    try:
+        with cf.ThreadPoolExecutor(max_workers=num_reader_threads) as ex:
+            it = iter(records)
+
+            def submit_one():
+                nonlocal read_phase_started, t_read_phase0
+                rec = next(it)
+                fut = ex.submit(read_image_bytes, rec)
+                inflight.add(fut)
+                if not read_phase_started:
+                    read_phase_started = True
+                    t_read_phase0 = time.perf_counter()
+
+            # prefill the inflight set with some tasks
+            for _ in range(min(max_inflight, len(records))):
+                try:
+                    submit_one()
+                except StopIteration:
+                    break
+
+            while inflight:
+                done, _ = cf.wait(inflight, return_when=cf.FIRST_COMPLETED)
+                for fut in done:
+                    inflight.remove(fut)
+
+                    record, data, t_read = fut.result()
+                    metrics.t_read += t_read
+                    metrics.num_bytes += len(data)
+
+                    sample = make_wds_sample(record, data)
+                    tw0 = time.perf_counter()
+                    sink.write(sample)
+                    metrics.t_write += time.perf_counter() - tw0
+
+                    metrics.num_samples += 1
+                    maybe_log_progress(metrics)
+
+                    try:
+                        submit_one()
+                    except StopIteration:
+                        pass
+
+            if read_phase_started:
+                t_read_phase1 = time.perf_counter()
+
+    finally:
+        sink.close()
+
+    metrics.end_time = time.perf_counter()
+    metrics.wall_total = metrics.end_time - metrics.start_time
+    metrics.wall_read = (t_read_phase1 - t_read_phase0) if read_phase_started else 0.0
+    metrics.wall_write = metrics.wall_total - metrics.t_enum
+
+    return metrics
+
+
+def write_all_splits(
+    dataset_root: Path,
+    out_dir: Path,
+    shard_size: int = 1000,
+    num_reader_threads: int = 16,
+    max_inflight: int = 256,
+) -> Dict[str, Metrics]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results: Dict[str, Metrics] = {}
+    for split in ("train", "val", "test"):
+        out_pattern = str(out_dir / split / f"{split}-%06d.tar")
+        results[split] = write_split_shards(
+            dataset_root=dataset_root,
+            split=split,
+            out_pattern=out_pattern,
+            shard_size=shard_size,
+            num_reader_threads=num_reader_threads,
+            max_inflight=max_inflight,
+        )
+    return results
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-root", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--shard-size", type=int, default=10000)
+    parser.add_argument("--num-reader-threads", type=int, default=16)
+    parser.add_argument("--max-inflight", type=int, default=256)
+    args = parser.parse_args()
+
+    dataset_root = Path(args.dataset_root)
+    output_dir = Path(args.output_dir)
+    shard_size = args.shard_size
+    num_reader_threads = min(os.cpu_count() or 1, args.num_reader_threads)
+    max_inflight = args.max_inflight
+
+    print(f"Using {num_reader_threads} reader threads")
+
+    results = write_all_splits(
+        dataset_root=dataset_root,
+        out_dir=output_dir,
+        shard_size=shard_size,
+        num_reader_threads=num_reader_threads,
+        max_inflight=max_inflight,
+    )
+
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump({split: metrics.__dict__ for split, metrics in results.items()}, f, indent=2)
