@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple, List
+from typing import Dict, Iterator, Optional, Tuple
 import os
 import time
 import concurrent.futures as cf
@@ -20,7 +20,9 @@ class Record:
 class Metrics:
     start_time: float = 0.0
     end_time: float = 0.0
+
     wall_total: float = 0.0
+    wall_pipeline: float = 0.0
     wall_read: float = 0.0
     wall_write: float = 0.0
 
@@ -31,6 +33,10 @@ class Metrics:
     t_enum: float = 0.0
     t_read: float = 0.0
     t_write: float = 0.0
+
+    sps_total: float = 0.0
+    sps_read: float = 0.0
+    sps_write: float = 0.0
 
 
 def start_timer() -> float:
@@ -43,7 +49,7 @@ def stop_timer(t0: float) -> float:
 
 def _is_image(p: Path) -> bool:
     s = p.suffix.lower()
-    return s in {".jpg", ".jpeg", ".png", ".jfif", ".jpe", ".webp", ".bmp", ".tif", ".tiff"}
+    return s in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 
 def make_key_from_relpath(relpath: str) -> str:
@@ -87,10 +93,11 @@ def collect_split_records(dataset_root: Path, split: str):
     return records, stop_timer(t0)
 
 
-def read_image_bytes(record: Record) -> Tuple[Record, bytes, float]:
+def read_image_bytes(record: Record) -> Tuple[Record, bytes, float, float, float]:
     t0 = time.perf_counter()
     data = record.path.read_bytes()
-    return record, data, time.perf_counter() - t0
+    t1 = time.perf_counter()
+    return record, data, t1 - t0, t0, t1
 
 
 def make_wds_sample(record: Record, img_bytes: bytes) -> dict:
@@ -116,17 +123,16 @@ def maybe_log_progress(metrics: Metrics, every_secs: float = 2.0) -> None:
     sps = metrics.num_samples / elapsed
     mb = metrics.num_bytes / (1024 * 1024)
     mbps = mb / elapsed
-    rps = metrics.num_samples / metrics.t_read if metrics.t_read > 0 else 0.0
-    wps = metrics.num_samples / metrics.t_write if metrics.t_write > 0 else 0.0
+    rps = metrics.num_samples / metrics.wall_read if metrics.wall_read > 0 else 0.0
+    wps = metrics.num_samples / metrics.wall_write if metrics.wall_write > 0 else 0.0
     print(
         f"samples={metrics.num_samples}  "
         f"elapsed={elapsed:.1f}s  "
-        # f"sps={sps:.1f}  "
         f"read_MB={mb:.1f}  "
         f"MBps={mbps:.1f}  "
         f"read_sps={rps:.1f}  "
         f"write_sps={wps:.1f} "
-        f"throughput={metrics.num_samples / elapsed:.1f} samples/s"
+        f"throughput={sps:.1f} samples/s"
     )
     metrics.last_log_time = now
 
@@ -139,10 +145,12 @@ def write_split_shards(
     num_reader_threads: int,
     max_inflight: int,
 ) -> Metrics:
-    metrics = Metrics(start_time=time.perf_counter())
+    total_t0 = time.perf_counter()
+    metrics = Metrics()
 
     records, t_enum = collect_split_records(dataset_root, split)
     metrics.t_enum = t_enum
+    metrics.start_time = time.perf_counter()
 
     out_dir = Path(out_pattern).parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -150,22 +158,17 @@ def write_split_shards(
     sink = webdataset.ShardWriter(out_pattern, maxcount=shard_size)
 
     inflight = set()
-    read_phase_started = False
-    t_read_phase0 = 0.0
-    t_read_phase1 = 0.0
+    read_span_start: Optional[float] = None
+    read_span_end: Optional[float] = None
 
     try:
         with cf.ThreadPoolExecutor(max_workers=num_reader_threads) as ex:
             it = iter(records)
 
             def submit_one():
-                nonlocal read_phase_started, t_read_phase0
                 rec = next(it)
                 fut = ex.submit(read_image_bytes, rec)
                 inflight.add(fut)
-                if not read_phase_started:
-                    read_phase_started = True
-                    t_read_phase0 = time.perf_counter()
 
             # prefill the inflight set with some tasks
             for _ in range(min(max_inflight, len(records))):
@@ -175,18 +178,26 @@ def write_split_shards(
                     break
 
             while inflight:
-                done, _ = cf.wait(inflight, return_when=cf.FIRST_COMPLETED)
+                done, _ = cf.wait(inflight, return_when=cf.ALL_COMPLETED)
                 for fut in done:
                     inflight.remove(fut)
 
-                    record, data, t_read = fut.result()
+                    record, data, t_read, tr0, tr1 = fut.result()
                     metrics.t_read += t_read
                     metrics.num_bytes += len(data)
+                    if read_span_start is None or tr0 < read_span_start:
+                        read_span_start = tr0
+                    if read_span_end is None or tr1 > read_span_end:
+                        read_span_end = tr1
+                    if read_span_start is not None and read_span_end is not None:
+                        metrics.wall_read = max(0.0, read_span_end - read_span_start)
 
                     sample = make_wds_sample(record, data)
                     tw0 = time.perf_counter()
                     sink.write(sample)
-                    metrics.t_write += time.perf_counter() - tw0
+                    tw1 = time.perf_counter()
+                    metrics.t_write += tw1 - tw0
+                    metrics.wall_write = metrics.t_write
 
                     metrics.num_samples += 1
                     maybe_log_progress(metrics)
@@ -196,16 +207,15 @@ def write_split_shards(
                     except StopIteration:
                         pass
 
-            if read_phase_started:
-                t_read_phase1 = time.perf_counter()
-
     finally:
         sink.close()
 
     metrics.end_time = time.perf_counter()
-    metrics.wall_total = metrics.end_time - metrics.start_time
-    metrics.wall_read = (t_read_phase1 - t_read_phase0) if read_phase_started else 0.0
-    metrics.wall_write = metrics.wall_total - metrics.t_enum
+    metrics.wall_total = metrics.end_time - total_t0
+    metrics.wall_pipeline = metrics.end_time - metrics.start_time
+    metrics.sps_total = metrics.num_samples / metrics.wall_pipeline if metrics.wall_pipeline > 0 else 0.0
+    metrics.sps_read = metrics.num_samples / metrics.wall_read if metrics.wall_read > 0 else 0.0
+    metrics.sps_write = metrics.num_samples / metrics.wall_write if metrics.wall_write > 0 else 0.0
 
     return metrics
 
@@ -239,9 +249,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument("--shard-size", type=int, default=10000)
-    parser.add_argument("--num-reader-threads", type=int, default=16)
-    parser.add_argument("--max-inflight", type=int, default=256)
+    parser.add_argument("--shard-size", type=int, default=15000)
+    parser.add_argument("--num-reader-threads", type=int, default=32)
+    parser.add_argument("--max-inflight", type=int, default=500)
     args = parser.parse_args()
 
     dataset_root = Path(args.dataset_root)
